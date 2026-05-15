@@ -1,10 +1,11 @@
 import 'dotenv/config';
+import path from 'node:path';
 import {
   DEFAULT_LINKEDIN_COOKIE,
   DEFAULT_LINKEDIN_URL,
 } from './constants.js';
 import { config } from './config.js';
-import { saveToFile } from './utils/fileHandler.js';
+import { findLatestLiveJsonl, saveToFile } from './utils/fileHandler.js';
 import * as logger from './utils/logger.js';
 import {
   run,
@@ -29,7 +30,7 @@ process.on('uncaughtException', (err) => {
  * @param {string[]} argv
  */
 function parseArgs(argv) {
-  /** @type {{ url?: string, cookie?: string, max?: number, batchSize?: number, parallelTabs?: number, format?: 'json'|'csv'|'both', headed?: boolean, profile?: boolean, help?: boolean }} */
+  /** @type {{ url?: string, cookie?: string, max?: number, batchSize?: number, parallelTabs?: number, format?: 'json'|'csv'|'both', headed?: boolean, profile?: boolean, resume?: string | true, forceReenrich?: boolean, help?: boolean }} */
   const out = {};
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -41,6 +42,10 @@ function parseArgs(argv) {
     else if (a === '--format') out.format = /** @type {'json'|'csv'|'both'} */ (argv[++i]);
     else if (a === '--headed') out.headed = true;
     else if (a === '--profile') out.profile = true;
+    else if (a === '--resume') {
+      const next = argv[i + 1];
+      out.resume = next && !next.startsWith('-') ? argv[++i] : true;
+    } else if (a === '--force-reenrich') out.forceReenrich = true;
     else if (a === '--help' || a === '-h') out.help = true;
   }
   return out;
@@ -59,6 +64,8 @@ Options:
   --batch-size     List N people, enrich those profiles, repeat (default ${config.batchSize})
   --parallel-tabs  Profile enrichment tabs in parallel (default ${config.parallelTabs}, max ${config.parallelTabsMax})
   --format         json | csv | both (default json)
+  --resume           Continue profile enrichment on an existing .jsonl (latest in output/ if no path)
+  --force-reenrich   With --resume: re-visit every profile (e.g. after date-scrape fix)
   --headed    Run browser non-headless for debugging
   -h, --help  Show this help
 `);
@@ -120,6 +127,23 @@ async function main() {
 
   const headless = args.headed ? false : config.headless;
 
+  let resumeFromJsonl;
+  if (args.resume !== undefined) {
+    if (args.resume === true) {
+      const latest = await findLatestLiveJsonl();
+      if (!latest) {
+        logger.error(
+          'No linkedin_people_live_*.jsonl in output/. Run a scrape first or pass --resume <path-to.jsonl>.',
+        );
+        process.exit(1);
+      }
+      resumeFromJsonl = latest;
+      logger.info('Resume: using latest live output', { resumeFromJsonl });
+    } else {
+      resumeFromJsonl = path.resolve(String(args.resume));
+    }
+  }
+
   logger.info('Starting scrape', {
     url,
     maxPeople,
@@ -128,6 +152,7 @@ async function main() {
     format,
     headless,
     useProfile,
+    resume: resumeFromJsonl ?? null,
   });
 
   try {
@@ -137,6 +162,8 @@ async function main() {
       parallelTabs,
       headless,
       useProfile,
+      resumeFromJsonl,
+      forceReenrich: args.forceReenrich,
     });
 
     if (!people.length) {

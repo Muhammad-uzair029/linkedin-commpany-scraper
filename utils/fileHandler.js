@@ -2,6 +2,39 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { config } from '../config.js';
 
+/** @param {string} filePath */
+export function baseNameFromOutputPath(filePath) {
+  const name = path.basename(filePath);
+  return name.replace(/\.jsonl$/i, '').replace(/\.json$/i, '').replace(/\.csv$/i, '');
+}
+
+/**
+ * Most recently modified linkedin_people_live_*.jsonl in output/.
+ * @param {string} [outputDir]
+ * @returns {Promise<string | null>}
+ */
+export async function findLatestLiveJsonl(outputDir = config.outputDir) {
+  let names = [];
+  try {
+    names = await fs.readdir(outputDir);
+  } catch {
+    return null;
+  }
+
+  let latestPath = null;
+  let latestMtime = 0;
+  for (const name of names) {
+    if (!name.startsWith('linkedin_people_live_') || !name.endsWith('.jsonl')) continue;
+    const p = path.join(outputDir, name);
+    const st = await fs.stat(p);
+    if (st.mtimeMs > latestMtime) {
+      latestMtime = st.mtimeMs;
+      latestPath = p;
+    }
+  }
+  return latestPath;
+}
+
 /**
  * Incremental writer: append JSONL + periodically update a meta JSON file.
  * @param {{ baseName?: string }} [opts]
