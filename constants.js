@@ -1,6 +1,6 @@
-/** Default People page when CLI / env omit URL. */
+/** Default People page when CLI / env omit URL (Pakistan geo + sales filter). */
 export const DEFAULT_LINKEDIN_URL =
-  'https://www.linkedin.com/company/motive-inc/people/?keywords=sales';
+  'https://www.linkedin.com/company/motive-inc/people/?facetGeoRegion=101022442&keywords=sales';
 
 /** @type {string} */
 let defaultCookie = '';

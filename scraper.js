@@ -472,7 +472,7 @@ export async function clickShowMore(page) {
   }
   if (clicked) {
     // Let DOM update / results render.
-    await sleep(randomBetween(700, 1200));
+    await sleep(randomBetween(config.showMoreDelayMinMs, config.showMoreDelayMaxMs));
     try {
       await page.evaluate(() => {
         // Scroll a bit to keep the newly loaded cards in view.
@@ -506,7 +506,7 @@ export async function countProfileAnchors(page) {
 export async function waitForMoreResults(page, prevAnchorCount) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    await sleep(500);
+    await sleep(900);
     const next = await countProfileAnchors(page);
     if (next > prevAnchorCount + 3) return true;
   }
@@ -581,7 +581,15 @@ export async function scrollAndLoad(page) {
  * @param {Map<string, PersonRecord>} map
  * @param {RawPersonRow[]} rows
  */
+/**
+ * @param {Map<string, PersonRecord>} map
+ * @param {RawPersonRow[]} rows
+ * @returns {PersonRecord[]} newly added people
+ */
 export function mergePeopleRows(map, rows) {
+  /** @type {PersonRecord[]} */
+  const added = [];
+
   for (const row of rows) {
     const profileUrl = normalizeProfileUrl(row.href);
     if (!profileUrl || !isValidProfileUrl(profileUrl)) continue;
@@ -613,6 +621,7 @@ export function mergePeopleRows(map, rows) {
 
     if (!map.has(key)) {
       map.set(key, incoming);
+      added.push(incoming);
       continue;
     }
 
@@ -638,6 +647,8 @@ export function mergePeopleRows(map, rows) {
     }
     map.set(key, next);
   }
+
+  return added;
 }
 
 /**
@@ -736,30 +747,76 @@ export async function scrapeProfileAbout(page) {
 }
 
 /**
- * Scroll the profile page until the Experience heading is in view.
+ * Scroll the profile page until the Experience heading is in view and any
+ * lazy-loaded experience cards have rendered. We progressively scroll if the
+ * heading isn't there yet (it usually lives 400-800px below the top).
  * @param {import('puppeteer').Page} page
  */
 export async function scrollToExperienceSection(page) {
   try {
-    await page.evaluate(() => {
-      const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-      const h2 = [...document.querySelectorAll('h2')].find((h) =>
-        /^experience$/i.test(norm(h.innerText || h.textContent)),
-      );
-      const anchor =
-        document.querySelector('#experience') ||
-        document.querySelector('[data-testid*="ExperienceTopLevelSection"]') ||
-        h2;
-      anchor?.scrollIntoView({ block: 'center', behavior: 'instant' });
-    });
-    await sleep(randomBetween(800, 1500));
-    await page.evaluate(() => window.scrollBy(0, 200));
-    await sleep(randomBetween(400, 700));
-    await page.evaluate(() => window.scrollBy(0, 400));
+    const findHeading = async () =>
+      page.evaluate(() => {
+        const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+        const anchor =
+          document.querySelector('#experience') ||
+          document.querySelector('[data-testid*="ExperienceTopLevelSection"]') ||
+          [...document.querySelectorAll('h2, h3')].find((h) =>
+            /^experience$/i.test(norm(h.innerText || h.textContent)),
+          );
+        if (!anchor) return false;
+        anchor.scrollIntoView({ block: 'center', behavior: 'instant' });
+        return true;
+      });
+
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      if (await findHeading()) break;
+      await page.evaluate(() => window.scrollBy(0, 500));
+      await sleep(randomBetween(450, 800));
+    }
+
+    await sleep(randomBetween(700, 1100));
+    await page.evaluate(() => window.scrollBy(0, 220));
+    await sleep(randomBetween(350, 600));
+    await page.evaluate(() => window.scrollBy(0, 380));
     await sleep(randomBetween(300, 500));
   } catch {
     /* ignore */
   }
+}
+
+/**
+ * Scroll-poll until a Motive logo or `/company/3271606` link appears in the DOM.
+ * @param {import('puppeteer').Page} page
+ * @param {number} [timeoutMs]
+ * @returns {Promise<boolean>}
+ */
+export async function waitForMotiveBlock(page, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const found = await page.evaluate(() => {
+        const hasLogo = !![
+          ...document.querySelectorAll(
+            'img[alt*="Motive" i], svg[aria-label*="Motive" i], img[src*="motive_inc_logo"]',
+          ),
+        ].length;
+        const hasLink = !!document.querySelector(
+          'a[href*="/company/3271606"], a[href*="/company/motive-inc"], a[href*="/company/keeptruckin"]',
+        );
+        return hasLogo || hasLink;
+      });
+      if (found) return true;
+    } catch {
+      return false;
+    }
+    try {
+      await page.evaluate(() => window.scrollBy(0, 600));
+    } catch {
+      return false;
+    }
+    await sleep(randomBetween(700, 1100));
+  }
+  return false;
 }
 
 /**
@@ -868,23 +925,24 @@ export async function scrapeCompanyExperience(
     };
 
     const getExperienceScope = () => {
-      const walkUpForItems = (start) => {
-        let el = start;
-        for (let i = 0; i < 12 && el; i++) {
-          if (el.querySelector('[componentkey*="entity-collection-item"]')) return el;
-          el = el.parentElement;
-        }
-        return start?.closest('section') || start?.parentElement || start;
+      const fromAnchor = (start) => {
+        if (!start) return null;
+        return (
+          start.closest('section') ||
+          start.parentElement?.parentElement ||
+          start.parentElement ||
+          document.querySelector('main')
+        );
       };
       const anchor = document.querySelector('#experience');
-      if (anchor) return walkUpForItems(anchor);
+      if (anchor) return fromAnchor(anchor);
       const byTestId = document.querySelector('[data-testid*="Experience"]');
-      if (byTestId) return walkUpForItems(byTestId);
-      const h2 = [...document.querySelectorAll('h2')].find((h) =>
+      if (byTestId) return fromAnchor(byTestId);
+      const h2 = [...document.querySelectorAll('h2, h3')].find((h) =>
         /^experience$/i.test(norm(h.innerText || h.textContent)),
       );
-      if (h2) return walkUpForItems(h2);
-      return document.querySelector('main');
+      if (h2) return fromAnchor(h2);
+      return document.querySelector('main') || document.body;
     };
 
     /** Must have Motive logo or /company/3271606 link — no text-only guesses. */
@@ -941,13 +999,22 @@ export async function scrapeCompanyExperience(
 
     /** @param {Element} start */
     const findCardRoot = (start) => {
-      const byItem = start.closest('[componentkey*="entity-collection-item"]');
+      const byItem =
+        start.closest('[componentkey*="entity-collection-item"]') ||
+        start.closest('li.pvs-list__paged-list-item') ||
+        start.closest('li.artdeco-list__item') ||
+        start.closest('.pvs-entity');
       if (byItem) return byItem;
       let el = start;
       for (let depth = 0; depth < 16 && el; depth += 1) {
         if (el.getAttribute?.('componentkey')?.includes('entity-collection-item')) return el;
+        if (el.classList?.contains('pvs-list__paged-list-item')) return el;
+        if (el.classList?.contains('artdeco-list__item')) return el;
+        if (el.classList?.contains('pvs-entity')) return el;
         const hasLogo = [...el.querySelectorAll('img, svg')].some(isMotiveLogo);
-        const ps = [...el.querySelectorAll('p')].filter((p) => !p.closest('ul'));
+        const ps = [...el.querySelectorAll('p, span[aria-hidden="true"]')].filter(
+          (n) => !n.closest('ul'),
+        );
         const companyLink = [...el.querySelectorAll('a[href*="/company/"]')].find((a) =>
           matchesCompany('', a.getAttribute('href') || ''),
         );
@@ -961,10 +1028,16 @@ export async function scrapeCompanyExperience(
     const collectLines = (root) => {
       /** @type {string[]} */
       const lines = [];
+      const pushIf = (t) => {
+        if (t && !isJunkLine(t) && t.length < 500 && !/^experience$/i.test(t)) lines.push(t);
+      };
       root.querySelectorAll('p').forEach((p) => {
         if (p.closest('ul')) return;
-        const t = norm(p.innerText);
-        if (t && !isJunkLine(t) && t.length < 500 && !/^experience$/i.test(t)) lines.push(t);
+        pushIf(norm(p.innerText));
+      });
+      root.querySelectorAll('span[aria-hidden="true"]').forEach((s) => {
+        if (s.closest('ul')) return;
+        pushIf(norm(s.textContent));
       });
       if (lines.length < 2) {
         norm(root.innerText)
@@ -1097,16 +1170,199 @@ export async function scrapeCompanyExperience(
     /** @param {Element} root */
     const parseMotiveBlock = (root) => parseGroupedMotiveBlock(root) || parseSingleMotiveBlock(root);
 
+    /**
+     * Build a Motive result by reading title / company line / dates / location
+     * from a card element's <p> + <span aria-hidden> nodes in document order.
+     * @param {Element} card
+     * @returns {object | null}
+     */
+    const buildMotiveResultFromCard = (card) => {
+      if (!card) return null;
+      const lines = collectLines(card);
+      if (!lines.length) return null;
+      const href = companyHref(card);
+      const companyLine = lines.find(
+        (l) => /^motive\s*·/i.test(l) || matchesCompany(l, href || ''),
+      );
+      let company = 'Motive';
+      let employmentType = null;
+      if (companyLine) {
+        const split = splitCompanyLine(companyLine);
+        if (split.company) {
+          company = split.company;
+          employmentType = split.employmentType;
+        }
+      }
+      const dates = findDateLine(card, lines) || null;
+      const location = lines.find((l) => isLocationLine(l)) || null;
+      const used = new Set([companyLine, dates, location].filter(Boolean));
+      const title = lines.find((l) => !used.has(l) && isLikelyJobTitle(l)) || null;
+      if (!employmentType) {
+        const empLine = lines.find(
+          (l) => !used.has(l) && l !== title && /^motive\s*·/i.test(l),
+        );
+        if (empLine) employmentType = splitCompanyLine(empLine).employmentType;
+      }
+      /** @type {CompanyRole[]} */
+      const roles = [];
+      if (title || dates) roles.push({ title, dates, description: null });
+      const parsed = {
+        company,
+        employmentType,
+        location,
+        roles,
+        companyUrl: href,
+      };
+      if (!isValidMotiveResult(parsed)) return null;
+      return parsed;
+    };
+
+    /**
+     * Locate the first experience card that appears right after the "Experience"
+     * heading and parse it as Motive. The user confirmed that for current Motive
+     * employees the very first card is the Motive one.
+     * @returns {object | null}
+     */
+    const parseFirstCardAfterExperienceHeading = () => {
+      const heading =
+        document.querySelector('#experience') ||
+        [...document.querySelectorAll('h2, h3')].find((h) =>
+          /^experience$/i.test(norm(h.innerText || h.textContent)),
+        );
+      if (!heading) return null;
+
+      let container = heading.parentElement;
+      for (let i = 0; i < 8 && container; i += 1) {
+        if (container.querySelector('a[href*="/company/"]')) break;
+        container = container.parentElement;
+      }
+      if (!container) container = heading.closest('section') || document.querySelector('main');
+      if (!container) return null;
+
+      const firstCompanyLink = container.querySelector('a[href*="/company/"]');
+      if (!firstCompanyLink) return null;
+
+      let card = firstCompanyLink;
+      let bestCard = null;
+      for (let i = 0; i < 14 && card; i += 1) {
+        const ps = [...card.querySelectorAll('p, span[aria-hidden="true"]')].filter(
+          (n) => !n.closest('ul'),
+        );
+        const uniqueTexts = new Set(
+          ps.map((n) => norm(n.innerText || n.textContent)).filter(Boolean),
+        );
+        if (uniqueTexts.size >= 3) {
+          bestCard = card;
+          break;
+        }
+        card = card.parentElement;
+      }
+      if (!bestCard) bestCard = firstCompanyLink.closest('li, div');
+      if (!bestCard) return null;
+
+      const href = firstCompanyLink.getAttribute('href') || '';
+      const matchesMotive =
+        matchesCompany('', href) ||
+        [...bestCard.querySelectorAll('img, svg')].some(isMotiveLogo) ||
+        [...bestCard.querySelectorAll('p, span[aria-hidden="true"]')].some((n) =>
+          /^motive\s*·/i.test(norm(n.innerText || n.textContent)),
+        );
+      if (!matchesMotive) return null;
+
+      return buildMotiveResultFromCard(bestCard);
+    };
+
+    /**
+     * Targeted parser for the new obfuscated layout (e.g. <div class="_905c4fe2 ...">).
+     * Starts from each Motive `<a href="/company/3271606/">` link inside the scope,
+     * climbs to the smallest ancestor that holds 3+ `<p>` siblings, and reads them in
+     * document order.
+     * @param {Element} scope
+     * @returns {object[]} list of parsed candidates
+     */
+    const parseObfuscatedMotiveCard = (scope) => {
+      const results = [];
+      const motiveLinks = [...scope.querySelectorAll('a[href*="/company/"]')].filter((a) =>
+        matchesCompany('', a.getAttribute('href') || ''),
+      );
+      const linkSeen = new Set();
+      for (const link of motiveLinks) {
+        let container = link;
+        let bestContainer = null;
+        for (let i = 0; i < 14 && container; i += 1) {
+          const ps = [...container.querySelectorAll('p, span[aria-hidden="true"]')].filter(
+            (n) => !n.closest('ul'),
+          );
+          const uniqueTexts = new Set(
+            ps.map((n) => norm(n.innerText || n.textContent)).filter(Boolean),
+          );
+          if (uniqueTexts.size >= 3) {
+            bestContainer = container;
+            break;
+          }
+          container = container.parentElement;
+        }
+        if (!bestContainer) continue;
+        const key = bestContainer.getAttribute?.('componentkey') ||
+          (bestContainer.innerText || '').slice(0, 120);
+        if (linkSeen.has(key)) continue;
+        linkSeen.add(key);
+
+        const href = link.getAttribute('href') || companyHref(bestContainer);
+        const lines = collectLines(bestContainer);
+        if (!lines.length) continue;
+
+        const companyLine = lines.find(
+          (l) => /^motive\s*·/i.test(l) || matchesCompany(l, href || ''),
+        );
+        let company = 'Motive';
+        let employmentType = null;
+        if (companyLine) {
+          const split = splitCompanyLine(companyLine);
+          if (split.company) {
+            company = split.company;
+            employmentType = split.employmentType;
+          }
+        }
+
+        const dates = findDateLine(bestContainer, lines) || null;
+        const location = lines.find((l) => isLocationLine(l)) || null;
+        const used = new Set([companyLine, dates, location].filter(Boolean));
+        const title = lines.find((l) => !used.has(l) && isLikelyJobTitle(l)) || null;
+
+        if (!employmentType) {
+          const empLine = lines.find(
+            (l) => !used.has(l) && l !== title && /^motive\s*·/i.test(l),
+          );
+          if (empLine) employmentType = splitCompanyLine(empLine).employmentType;
+        }
+
+        /** @type {CompanyRole[]} */
+        const roles = [];
+        if (title || dates) roles.push({ title, dates, description: null });
+
+        const parsed = {
+          company,
+          employmentType,
+          location,
+          roles,
+          companyUrl: href,
+        };
+        if (!isValidMotiveResult(parsed)) continue;
+        results.push(parsed);
+      }
+      return results;
+    };
+
     const scope = getExperienceScope();
     if (!scope) return null;
 
-    let blocks = [...scope.querySelectorAll('[componentkey*="entity-collection-item"]')];
     /** @type {{ parsed: object, score: number }[]} */
     const candidates = [];
     const seen = new Set();
 
     const tryBlock = (block) => {
-      const key = block.getAttribute('componentkey') || block.innerText?.slice(0, 100);
+      const key = block.getAttribute?.('componentkey') || (block.innerText || '').slice(0, 100);
       if (key && seen.has(key)) return;
       if (key) seen.add(key);
       if (!isMotiveBlock(block)) return;
@@ -1115,7 +1371,26 @@ export async function scrapeCompanyExperience(
       if (parsed && score > 0) candidates.push({ parsed, score });
     };
 
+    const firstCard = parseFirstCardAfterExperienceHeading();
+    if (firstCard) {
+      const score = scoreMotiveResult(firstCard, scope) + 100;
+      candidates.push({ parsed: firstCard, score });
+    }
+
+    for (const parsed of parseObfuscatedMotiveCard(scope)) {
+      const score = scoreMotiveResult(parsed, scope) + 60;
+      candidates.push({ parsed, score });
+    }
+
+    let blocks = [...scope.querySelectorAll('[componentkey*="entity-collection-item"]')];
     for (const block of blocks) tryBlock(block);
+
+    const pvsBlocks = [
+      ...scope.querySelectorAll(
+        'li.pvs-list__paged-list-item, li.artdeco-list__item, .pvs-entity',
+      ),
+    ];
+    for (const block of pvsBlocks) tryBlock(block);
 
     /** @type {Element[]} */
     const markers = [];
@@ -1146,7 +1421,9 @@ export function isValidMotiveExperience(motive) {
     if (r.title && (badTitle.test(r.title) || badWord.test(r.title))) return false;
   }
   if (motive.companyUrl) return true;
-  return (motive.roles || []).some((r) => r.dates && /\d{4}/.test(r.dates));
+  const roles = motive.roles || [];
+  if (roles.some((r) => r.dates || r.title)) return true;
+  return Boolean(motive.employmentType || motive.location);
 }
 
 /** @param {CompanyExperience | null} motive */
@@ -1368,122 +1645,315 @@ export function applyProfileDetails(person, details) {
     person.experiences = companyExperienceToRecords(details.motiveExperience);
   } else if (details.experiences?.length) {
     person.experiences = details.experiences;
+  } else if (!person.experiences?.length) {
+    const fallbackTitle =
+      person.title || person.about || person.company1 || null;
+    person.experiences = [
+      {
+        title: fallbackTitle,
+        company: config.targetCompanyName,
+        dates: null,
+        location: null,
+        description: null,
+      },
+    ];
   }
   person.profileEnriched = true;
 }
 
+function createAsyncMutex() {
+  let chain = Promise.resolve();
+  return {
+    /** @param {() => Promise<void>} fn */
+    run(fn) {
+      const next = chain.then(fn, fn);
+      chain = next.catch(() => {});
+      return next;
+    },
+  };
+}
+
 /**
- * Visit each profile URL and enrich records; saves JSONL after each person.
+ * Enrich one profile on an open tab.
  * @param {import('puppeteer').Page} page
- * @param {Map<string, PersonRecord>} map
- * @param {Awaited<ReturnType<typeof createIncrementalWriter>>} writer
- * @param {number} maxPeople
+ * @param {PersonRecord} person
  */
-export async function enrichProfilesFromPages(page, map, writer, maxPeople) {
-  const entries = [...map.entries()].slice(0, maxPeople);
-  let done = 0;
+async function enrichOneProfile(page, person) {
+  await page.goto(person.profileUrl, {
+    waitUntil: config.waitUntil,
+    timeout: config.navigationTimeoutMs,
+  });
+  await sleep(randomBetween(config.profileNavigationMinMs, config.profileNavigationMaxMs));
+  await page.waitForSelector('main, h1', { timeout: 15_000 }).catch(() => {});
+  await sleep(randomBetween(config.minDelayMs, config.maxDelayMs));
 
-  for (const [key, person] of entries) {
-    if (person.profileEnriched && isValidMotiveExperience(person.motiveExperience)) {
-      done += 1;
-      continue;
+  if (await detectSessionWall(page)) {
+    throw new SessionWallError('Session lost while opening profiles. Run npm run login again.');
+  }
+
+  const base = await page.evaluate(() => {
+    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+    const fullName =
+      norm(document.querySelector('h1')?.innerText) ||
+      norm(document.querySelector('main h1')?.innerText) ||
+      '';
+    let title = null;
+    for (const el of document.querySelectorAll('.text-body-medium, [data-generated-suggestion-target]')) {
+      const t = norm(el.innerText);
+      if (t && t !== fullName && t.length < 320 && !/followers|connections/i.test(t)) {
+        title = t;
+        break;
+      }
     }
+    return { fullName, title };
+  });
 
-    logger.info(`Enriching profile ${done + 1}/${entries.length}`, {
-      profileUrl: person.profileUrl,
-    });
+  const about = await scrapeProfileAbout(page);
 
+  /** @type {CompanyExperience | null} */
+  let motiveExperience = null;
+
+  await waitForMotiveBlock(page, 15_000);
+  try {
+    motiveExperience = await scrapeCompanyExperience(page);
+  } catch {
+    /* keep null */
+  }
+
+  if (!isValidMotiveExperience(motiveExperience)) {
+    motiveExperience = null;
     try {
-      await page.goto(person.profileUrl, {
-        waitUntil: config.waitUntil,
+      await page.goto(experienceDetailsUrl(person.profileUrl), {
+        waitUntil: 'domcontentloaded',
         timeout: config.navigationTimeoutMs,
       });
-      await sleep(randomBetween(800, 1200));
-      await page.waitForSelector('main, h1', { timeout: 15_000 }).catch(() => {});
+      await page
+        .waitForSelector(
+          'main, #experience, [componentkey*="entity-collection-item"], li.pvs-list__paged-list-item, .pvs-entity, li.artdeco-list__item',
+          { timeout: 15_000 },
+        )
+        .catch(() => {});
+      await waitForMotiveBlock(page, 10_000);
+      await sleep(randomBetween(config.profileNavigationMinMs, config.profileNavigationMaxMs));
+      motiveExperience = await scrapeCompanyExperience(page);
+    } catch {
+      /* keep null */
+    }
+  }
 
-      if (await detectSessionWall(page)) {
-        throw new SessionWallError('Session lost while opening profiles. Run npm run login again.');
-      }
+  if (!isValidMotiveExperience(motiveExperience)) motiveExperience = null;
 
-      const base = await page.evaluate(() => {
-        const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-        const fullName =
-          norm(document.querySelector('h1')?.innerText) ||
-          norm(document.querySelector('main h1')?.innerText) ||
-          '';
-        let title = null;
-        for (const el of document.querySelectorAll('.text-body-medium, [data-generated-suggestion-target]')) {
-          const t = norm(el.innerText);
-          if (t && t !== fullName && t.length < 320 && !/followers|connections/i.test(t)) {
-            title = t;
-            break;
-          }
-        }
-        return { fullName, title };
-      });
+  return {
+    ...base,
+    about: about || person.about || null,
+    motiveExperience,
+    experiences: [],
+  };
+}
 
-      const about = await scrapeProfileAbout(page);
+/**
+ * Visit profile URLs and enrich records (parallel tabs when parallelTabs > 1).
+ * @param {import('puppeteer').Browser} browser
+ * @param {Map<string, PersonRecord>} map
+ * @param {Awaited<ReturnType<typeof createIncrementalWriter>>} writer
+ * @param {{ startIndex?: number, endIndex?: number, batchNum?: number }} [range]
+ * @param {{ parallelTabs?: number }} [options]
+ */
+export async function enrichProfilesFromPages(browser, map, writer, range = {}, options = {}) {
+  const all = [...map.entries()];
+  const start = range.startIndex ?? 0;
+  const end = range.endIndex ?? all.length;
+  const entries = all.slice(start, end);
+  const toEnrich = entries.filter(
+    ([, person]) =>
+      !person.profileEnriched || !isValidMotiveExperience(person.motiveExperience),
+  );
 
-      let motiveExperience = await scrapeCompanyExperience(page);
+  const parallelTabs = Math.min(
+    Math.max(1, options.parallelTabs ?? config.parallelTabs),
+    config.parallelTabsMax,
+  );
 
-      if (!isValidMotiveExperience(motiveExperience)) {
-        motiveExperience = null;
-        try {
-          await page.goto(experienceDetailsUrl(person.profileUrl), {
-            waitUntil: 'domcontentloaded',
-            timeout: config.navigationTimeoutMs,
-          });
-          await sleep(randomBetween(2000, 3500));
-          motiveExperience = await scrapeCompanyExperience(page);
-        } catch {
-          /* keep null */
-        }
-      }
+  if (range.batchNum) {
+    logger.info(`Enriching batch ${range.batchNum}: ${toEnrich.length} profile(s)`, {
+      from: start + 1,
+      to: end,
+      total: all.length,
+      parallelTabs,
+    });
+  } else {
+    logger.info(`Enriching ${toEnrich.length} profile(s)`, { parallelTabs });
+  }
 
-      /** @type {Awaited<ReturnType<typeof extractProfileDetails>>} */
-      const details = {
-        ...base,
-        about: about || person.about || null,
-        motiveExperience,
-        experiences: [],
-      };
+  if (!toEnrich.length) return;
 
-      if (motiveExperience) {
-        logger.info(`Found ${config.targetCompanyName} experience`, {
-          profileUrl: person.profileUrl,
-          company: motiveExperience.company,
-          employmentType: motiveExperience.employmentType,
-          title: motiveExperience.roles?.[0]?.title ?? null,
-          dates: motiveExperience.roles?.[0]?.dates ?? null,
-        });
-      } else {
-        logger.warn(`No ${config.targetCompanyName} experience block found`, {
-          profileUrl: person.profileUrl,
-        });
-      }
+  const saveMutex = createAsyncMutex();
+  let completed = 0;
+  let nextIndex = 0;
 
-      applyProfileDetails(person, details);
-      map.set(key, person);
+  const writeMetaProgress = () =>
+    writer.writeMeta({
+      updatedAt: new Date().toISOString(),
+      phase: 'profile-enrichment',
+      parallelTabs,
+      enrichedCount: [...map.values()].filter((p) => p.profileEnriched).length,
+      totalUniquePeople: map.size,
+      jsonlPath: writer.jsonlPath,
+      csvPath: writer.csvPath,
+      jsonPath: writer.jsonPath,
+    });
 
-      await writer.rewritePeople([...map.values()]);
-      await writer.writeMeta({
-        updatedAt: new Date().toISOString(),
-        phase: 'profile-enrichment',
-        enrichedCount: [...map.values()].filter((p) => p.profileEnriched).length,
-        totalUniquePeople: map.size,
-        jsonlPath: writer.jsonlPath,
-      });
-    } catch (err) {
-      logger.warn('Profile enrich failed', {
+  /** @param {import('puppeteer').Page} page @param {number} workerId */
+  const worker = async (page, workerId) => {
+    while (true) {
+      const i = nextIndex++;
+      if (i >= toEnrich.length) break;
+
+      const [key, person] = toEnrich[i];
+
+      logger.info(`[tab ${workerId}] Enriching ${i + 1}/${toEnrich.length}`, {
         profileUrl: person.profileUrl,
-        message: err instanceof Error ? err.message : String(err),
       });
-      if (err instanceof SessionWallError) throw err;
+
+      try {
+        const details = await enrichOneProfile(page, person);
+
+        if (details.motiveExperience) {
+          logger.info(`[tab ${workerId}] Found ${config.targetCompanyName} experience`, {
+            profileUrl: person.profileUrl,
+            dates: details.motiveExperience.roles?.[0]?.dates ?? null,
+          });
+        } else {
+          logger.info(`[tab ${workerId}] No Motive experience parsed`, {
+            profileUrl: person.profileUrl,
+          });
+        }
+
+        await saveMutex.run(async () => {
+          applyProfileDetails(person, details);
+          map.set(key, person);
+          await writer.upsertPerson(person);
+        });
+
+        completed += 1;
+        if (completed % 5 === 0 || completed === toEnrich.length) {
+          await writeMetaProgress();
+        }
+      } catch (err) {
+        logger.warn(`[tab ${workerId}] Profile enrich failed`, {
+          profileUrl: person.profileUrl,
+          message: err instanceof Error ? err.message : String(err),
+        });
+        if (err instanceof SessionWallError) {
+          throw err;
+        }
+      }
+
+      await sleep(randomBetween(config.profileDelayMinMs, config.profileDelayMaxMs));
+    }
+  };
+
+  /** @type {import('puppeteer').Page[]} */
+  const workerPages = [];
+  try {
+    for (let t = 0; t < parallelTabs; t += 1) {
+      if (t > 0) {
+        await sleep(t * config.parallelTabStaggerMs + randomBetween(500, 1500));
+      }
+      try {
+        const p = await browser.newPage();
+        await preparePage(p);
+        workerPages.push(p);
+      } catch (err) {
+        logger.warn(`Failed to open worker tab #${t + 1}, continuing with ${workerPages.length}`, {
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
 
-    done += 1;
-    await sleep(randomBetween(config.profileDelayMinMs, config.profileDelayMaxMs));
+    if (!workerPages.length) {
+      throw new Error('Could not open any worker tab for enrichment');
+    }
+
+    const results = await Promise.allSettled(
+      workerPages.map((p, idx) => worker(p, idx + 1)),
+    );
+    const fatal = results.find(
+      (r) => r.status === 'rejected' && r.reason instanceof SessionWallError,
+    );
+    if (fatal && fatal.status === 'rejected') throw fatal.reason;
+    for (const r of results) {
+      if (r.status === 'rejected') {
+        logger.warn('Worker tab terminated', {
+          message: r.reason instanceof Error ? r.reason.message : String(r.reason),
+        });
+      }
+    }
+    await writeMetaProgress();
+  } finally {
+    for (const p of workerPages) {
+      await p.close().catch(() => {});
+    }
   }
+}
+
+/**
+ * Scroll the People listing until the map grows by up to `targetAdditional` people.
+ * @returns {Promise<{ collected: number, exhausted: boolean }>}
+ */
+async function collectListingBatch(page, map, writer, url, targetAdditional) {
+  const startSize = map.size;
+  let stallIterations = 0;
+
+  while (map.size < startSize + targetAdditional && stallIterations < config.stallIterations) {
+    const countBefore = map.size;
+    const anchorCountBefore = await countProfileAnchors(page);
+
+    await scrollAndLoad(page);
+
+    const rows = await extractPeopleData(page);
+    const added = mergePeopleRows(map, rows);
+
+    for (const person of added) {
+      await writer.upsertPerson(person);
+    }
+
+    logger.progressEvery(map.size, config.progressLogInterval);
+
+    const { appended } = { appended: added.length };
+    await writer.writeMeta({
+      updatedAt: new Date().toISOString(),
+      sourceUrl: url,
+      phase: 'listing',
+      totalUniquePeople: map.size,
+      appendedLastWrite: appended,
+      batchTarget: targetAdditional,
+      collectedInBatch: map.size - startSize,
+    });
+
+    if (map.size >= startSize + targetAdditional) break;
+
+    const clicked = await clickShowMore(page);
+    const moreRendered = clicked ? await waitForMoreResults(page, anchorCountBefore) : false;
+    if (!clicked) {
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+      await sleep(randomBetween(config.listingCycleMinMs, config.listingCycleMaxMs));
+    }
+
+    await sleep(randomBetween(config.listingCycleMinMs, config.listingCycleMaxMs));
+
+    const grewThisCycle = map.size > countBefore;
+    const shouldStall = !grewThisCycle && !clicked && !moreRendered;
+    if (shouldStall) {
+      stallIterations += 1;
+      logger.info(`No new people after load cycle (stall ${stallIterations}/${config.stallIterations})`);
+    } else {
+      stallIterations = 0;
+    }
+  }
+
+  const collected = map.size - startSize;
+  return { collected, exhausted: stallIterations >= config.stallIterations && collected < targetAdditional };
 }
 
 /**
@@ -1491,13 +1961,24 @@ export async function enrichProfilesFromPages(page, map, writer, maxPeople) {
  * @param {string} url
  * @param {{
  *   maxPeople?: number;
+ *   batchSize?: number;
+ *   parallelTabs?: number;
  *   format?: 'json' | 'csv' | 'both';
  *   headless?: boolean;
  *   useProfile?: boolean;
  * }} [options]
  */
 export async function run(cookieStr, url, options = {}) {
-  const maxPeople = options.maxPeople ?? config.maxPeople;
+  const maxPeople = Math.min(
+    options.maxPeople ?? config.maxPeople,
+    config.maxPeopleLimit,
+  );
+  const batchSize = options.batchSize ?? config.batchSize;
+  const parallelTabs = Math.min(
+    Math.max(1, options.parallelTabs ?? config.parallelTabs),
+    config.parallelTabsMax,
+  );
+  const useBatches = batchSize > 0 && config.scrapeProfiles;
   const headless = options.headless ?? config.headless;
   const useProfile = options.useProfile ?? config.useProfile;
 
@@ -1536,7 +2017,7 @@ export async function run(cookieStr, url, options = {}) {
     }
     await navigateToUrl(page, url);
 
-    await sleep(randomBetween(500, 1000));
+    await sleep(randomBetween(2000, 4000));
     await page.waitForSelector('body', { timeout: 10_000 }).catch(() => {});
 
     if (await detectSessionWall(page)) {
@@ -1555,68 +2036,98 @@ export async function run(cookieStr, url, options = {}) {
       sourceUrl: url,
       mode: useProfile ? 'profile' : 'cookie',
       jsonlPath: writer.jsonlPath,
+      jsonPath: writer.jsonPath,
     });
-    logger.info('Incremental output enabled', {
+    logger.info('Incremental output enabled (saved per person)', {
       jsonlPath: writer.jsonlPath,
+      jsonPath: writer.jsonPath,
+      csvPath: writer.csvPath,
       metaPath: writer.metaPath,
     });
 
-    while (map.size < maxPeople && stallIterations < config.stallIterations) {
-      const countBefore = map.size;
-      const anchorCountBefore = await countProfileAnchors(page);
+    let people = [];
 
-      // Scroll first so lazy-loaded profile cards mount, then scrape the current batch.
-      await scrollAndLoad(page);
-
-      const rows = await extractPeopleData(page);
-      mergePeopleRows(map, rows);
-
-      logger.progressEvery(map.size, config.progressLogInterval);
-
-      const peopleNow = [...map.values()];
-      const { appended } = await writer.appendPeople(peopleNow);
-      await writer.writeMeta({
-        updatedAt: new Date().toISOString(),
-        sourceUrl: url,
-        totalUniquePeople: map.size,
-        appendedLastWrite: appended,
+    if (useBatches) {
+      let batchNum = 0;
+      logger.info('Batch mode: list then enrich profiles per batch', {
+        batchSize,
         maxPeople,
-        stallIterations,
-        mode: useProfile ? 'profile' : 'cookie',
-        jsonlPath: writer.jsonlPath,
+        parallelTabs,
       });
 
-      if (map.size >= maxPeople) break;
+      while (map.size < maxPeople) {
+        batchNum += 1;
+        const batchStart = map.size;
+        const target = Math.min(batchSize, maxPeople - map.size);
 
-      // After scraping everyone visible in this batch, click "Show more results" for the next batch.
-      const clicked = await clickShowMore(page);
-      const moreRendered = clicked ? await waitForMoreResults(page, anchorCountBefore) : false;
-      if (!clicked) {
-        // No button: attempt one deeper scroll; if still no growth, we will stall out naturally.
-        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
-        await sleep(randomBetween(400, 800));
+        logger.info(`Batch ${batchNum}: collecting up to ${target} people from listing`, {
+          totalSoFar: map.size,
+          maxPeople,
+        });
+
+        const { collected, exhausted } = await collectListingBatch(page, map, writer, url, target);
+
+        logger.info(`Batch ${batchNum}: collected ${collected} new people`, {
+          totalSoFar: map.size,
+        });
+
+        if (collected > 0) {
+          logger.info(`Batch ${batchNum}: pausing before profile visits…`, {
+            cooldownMs: config.batchCooldownMs,
+          });
+          await sleep(
+            randomBetween(config.batchCooldownMs, config.batchCooldownMs + 8000),
+          );
+          logger.info(`Batch ${batchNum}: enriching ${collected} profile(s)…`);
+          await enrichProfilesFromPages(browser, map, writer, {
+            startIndex: batchStart,
+            endIndex: map.size,
+            batchNum,
+          }, { parallelTabs });
+          await writer.rewritePeople([...map.values()].slice(0, maxPeople));
+          await writer.writeMeta({
+            updatedAt: new Date().toISOString(),
+            phase: 'batch-complete',
+            batchNum,
+            batchCollected: collected,
+            totalUniquePeople: map.size,
+            enrichedCount: [...map.values()].filter((p) => p.profileEnriched).length,
+            jsonlPath: writer.jsonlPath,
+            jsonPath: writer.jsonPath,
+          });
+        }
+
+        if (map.size >= maxPeople) break;
+        if (collected === 0 && exhausted) {
+          logger.warn('Listing exhausted before reaching maxPeople', {
+            totalCollected: map.size,
+            maxPeople,
+          });
+          break;
+        }
       }
 
-      const grewThisCycle = map.size > countBefore;
-      // Don't count a stall if we successfully triggered more results and the page is still loading/rendering.
-      const shouldStall = !grewThisCycle && !clicked && !moreRendered;
-      if (shouldStall) {
-        stallIterations += 1;
-        logger.info(`No new people after load cycle (stall ${stallIterations}/${config.stallIterations})`);
-      } else {
-        stallIterations = 0;
-      }
-    }
-
-    let people = [...map.values()].slice(0, maxPeople);
-
-    if (config.scrapeProfiles && people.length > 0) {
-      logger.info('Opening each profile for fullName, title, about, and experiences…', {
-        count: people.length,
-      });
-      await enrichProfilesFromPages(page, map, writer, maxPeople);
       people = [...map.values()].slice(0, maxPeople);
-      await writer.rewritePeople(people);
+    } else {
+      while (map.size < maxPeople && stallIterations < config.stallIterations) {
+        const { collected } = await collectListingBatch(page, map, writer, url, maxPeople - map.size);
+        if (collected === 0) stallIterations += 1;
+        else stallIterations = 0;
+        if (map.size >= maxPeople) break;
+      }
+
+      people = [...map.values()].slice(0, maxPeople);
+
+      if (config.scrapeProfiles && people.length > 0) {
+        logger.info('Opening each profile for fullName, title, about, and experiences…', {
+          count: people.length,
+        });
+        await enrichProfilesFromPages(browser, map, writer, { endIndex: maxPeople }, {
+          parallelTabs,
+        });
+        people = [...map.values()].slice(0, maxPeople);
+        await writer.rewritePeople(people);
+      }
     }
 
     return {
@@ -1626,6 +2137,8 @@ export async function run(cookieStr, url, options = {}) {
         sourceUrl: url,
         totalCount: people.length,
         profileDetails: config.scrapeProfiles,
+        batchSize: useBatches ? batchSize : null,
+        parallelTabs: config.scrapeProfiles ? parallelTabs : null,
       },
     };
   } finally {
