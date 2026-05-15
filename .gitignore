@@ -1,0 +1,8 @@
+node_modules/
+output/*.json
+output/*.csv
+.env
+constants.local.js
+.linkedin-profile/
+.DS_Store
+*.log

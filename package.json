@@ -1,0 +1,25 @@
+{
+  "name": "linkedin-people-scraper",
+  "version": "1.0.0",
+  "description": "LinkedIn company People page scraper (session cookie + Puppeteer)",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "scrape": "node index.js",
+    "open-session": "node open-session.js",
+    "login": "node open-session.js --profile",
+    "scrape:profile": "node index.js --profile",
+    "scrape:2": "node index.js --profile --max 2 --format json",
+    "scrape:50": "node index.js --profile --max 50 --format json",
+    "postinstall": "npx puppeteer browsers install chrome",
+    "install-browser": "npx puppeteer browsers install chrome"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "puppeteer": "^24.2.0"
+  }
+}
